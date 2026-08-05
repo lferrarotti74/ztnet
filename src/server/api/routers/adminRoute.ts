@@ -6,7 +6,7 @@ import { type GlobalOptions, Role } from "@prisma/client";
 import { throwError } from "~/server/helpers/errorHandler";
 import type { ZTControllerNodeStatus } from "~/types/ztController";
 import type { NetworkAndMemberResponse } from "~/types/network";
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import fs from "node:fs";
 import type { WorldConfig } from "~/types/worldConfig";
 import axios from "axios";
@@ -17,6 +17,7 @@ import { decrypt, encrypt, generateInstanceSecret } from "~/utils/encryption";
 import { SMTP_SECRET } from "~/utils/encryption";
 import { ZT_FOLDER } from "~/utils/ztApi";
 import { isRunningInDocker } from "~/utils/docker";
+import { detectServerMajor, resolvePgDumpPath } from "~/utils/pgVersion";
 import { getNetworkClassCIDR } from "~/utils/IPv4gen";
 import type { InvitationLinkType } from "~/types/invitation";
 import { MailTemplateKey } from "~/utils/enums";
@@ -1362,12 +1363,44 @@ export const adminRouter = createTRPCRouter({
 								PGPASSWORD: password,
 							};
 
-							const dumpCommand = `pg_dump -h ${host} -p ${port} -U ${username} -d ${database} --verbose --clean --if-exists`;
-
-							execSync(`${dumpCommand} > "${dumpPath}"`, {
+							// Use the bundled pg_dump that matches the server's major version,
+							// since pg_dump refuses to dump servers newer than itself.
+							const serverMajor = detectServerMajor({
+								host,
+								port,
+								username,
+								database,
 								env,
-								stdio: ["pipe", "pipe", "inherit"],
 							});
+							const pgDumpBinary = resolvePgDumpPath(serverMajor);
+
+							// Run without a shell and write stdout straight to the dump file,
+							// so connection values with special characters cannot break the command.
+							const dumpFd = fs.openSync(dumpPath, "w");
+							try {
+								execFileSync(
+									pgDumpBinary,
+									[
+										"-h",
+										host,
+										"-p",
+										port,
+										"-U",
+										username,
+										"-d",
+										database,
+										"--verbose",
+										"--clean",
+										"--if-exists",
+									],
+									{
+										env,
+										stdio: ["ignore", dumpFd, "inherit"],
+									},
+								);
+							} finally {
+								fs.closeSync(dumpFd);
+							}
 
 							// Check if dump file was created and has content
 							if (fs.existsSync(dumpPath)) {
@@ -1628,12 +1661,21 @@ export const adminRouter = createTRPCRouter({
 							PGPASSWORD: password,
 						};
 
-						const restoreCommand = `psql -h ${host} -p ${port} -U ${username} -d ${database}`;
-
-						execSync(`${restoreCommand} < "${sqlDumpPath}"`, {
-							env,
-							stdio: ["pipe", "pipe", "inherit"],
-						});
+						// Run without a shell and feed the dump via stdin, so connection
+						// values with special characters cannot break the command.
+						const sqlFd = fs.openSync(sqlDumpPath, "r");
+						try {
+							execFileSync(
+								"psql",
+								["-h", host, "-p", port, "-U", username, "-d", database],
+								{
+									env,
+									stdio: [sqlFd, "pipe", "inherit"],
+								},
+							);
+						} finally {
+							fs.closeSync(sqlFd);
+						}
 					}
 				}
 
