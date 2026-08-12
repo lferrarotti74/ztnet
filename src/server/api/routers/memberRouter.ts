@@ -5,6 +5,10 @@ import { TRPCError } from "@trpc/server";
 import { type MemberEntity } from "~/types/local/member";
 import { checkUserOrganizationRole } from "~/utils/role";
 import { checkNetworkAccess } from "~/utils/networkAccess";
+import {
+	preferredMemberName,
+	serializeMemberRow,
+} from "~/server/api/services/memberService";
 import { Role } from "@prisma/client";
 import {
 	HookType,
@@ -58,9 +62,12 @@ export const networkMemberRouter = createTRPCRouter({
 					nwid: input.nwid,
 				},
 			});
+			// serializeMemberRow: the controllerConfig cache column is internal —
+			// the fresh controller object is merged in directly instead.
 			return {
-				...dbMember,
+				...serializeMemberRow(dbMember),
 				...ztMembers,
+				name: preferredMemberName(dbMember?.name, ztMembers?.name),
 			};
 		}),
 	create: protectedProcedure

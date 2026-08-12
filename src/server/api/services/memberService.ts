@@ -6,7 +6,7 @@ import { prisma } from "~/server/db";
 import { sendWebhook } from "~/utils/webhook";
 import { HookType, MemberJoined } from "~/types/webhooks";
 import { throwError } from "~/server/helpers/errorHandler";
-import { network_members } from "@prisma/client";
+import { network_members, Prisma } from "@prisma/client";
 
 /**
  * syncMemberPeersAndStatus
@@ -378,7 +378,7 @@ export const fetchZombieMembers = async (
 	});
 
 	const zombieMembers = await Promise.all(getZombieMembersPromises);
-	return zombieMembers.filter(Boolean);
+	return zombieMembers.filter(Boolean).map(serializeMemberRow);
 };
 
 const MEMBER_DETAIL_BATCH_SIZE = 5;
@@ -452,6 +452,10 @@ export const reconcileNetworkMembers = async (
 		if (db && (db.deleted || db.permanentlyDeleted)) return false;
 		if (!db) return true;
 		if (options.full) return true;
+		// NULL vMajor/controllerConfig = row predates the version or controller
+		// object cache (#984/#983); backfill it once. (The controller stores -1
+		// for an unknown version, so this never re-triggers.)
+		if (db.vMajor == null || db.controllerConfig == null) return true;
 		return db.revision == null || db.revision !== revisionMap[id];
 	});
 
@@ -472,6 +476,8 @@ export const reconcileNetworkMembers = async (
 				activeBridge: !!detail.activeBridge,
 				address: detail.address ?? detail.id,
 				revision: revisionMap[detail.id] ?? null,
+				// Client version + raw controller object cache (#984/#983).
+				...controllerCacheFields(detail),
 				// Smart name preservation (#719): adopt the controller name only when the
 				// DB has none — never clobber a user-set name.
 				...(!db?.name?.trim() && detail.name?.trim() ? { name: detail.name } : {}),
@@ -505,14 +511,7 @@ export const reconcileNetworkMembers = async (
 	const statusWrites: Promise<unknown>[] = [];
 	const enriched = activeDbMembers.map((db) => {
 		const peers = peersByAddress.get(db.address || "") ?? ({} as Peers);
-		const activePreferredPath = findActivePreferredPeerPath(peers);
-		const member = {
-			...db,
-			peers,
-			physicalAddress: activePreferredPath?.address ?? db.physicalAddress,
-		} as unknown as MemberEntity;
-
-		member.conStatus = determineConnectionStatus(member);
+		const member = buildServedMember(db, peers);
 		const online = Object.keys(peers).length > 0 && member.conStatus !== 0;
 
 		// diff-skip: offline-and-unchanged members are never rewritten.
@@ -521,6 +520,16 @@ export const reconcileNetworkMembers = async (
 			if (online) {
 				data.lastSeen = new Date();
 				if (member.physicalAddress) data.physicalAddress = member.physicalAddress;
+				// The controller does not bump a member's revision when its client
+				// version changes, so the revision-gated detail fetch above can't keep
+				// the cached version fresh. Persist the live peer version while online;
+				// offline members keep the last known value (#984). The peer object
+				// carries no protocol version, so vProto stays detail-sourced.
+				if (typeof peers.versionMajor === "number" && peers.versionMajor !== -1) {
+					data.vMajor = peers.versionMajor;
+					data.vMinor = peers.versionMinor;
+					data.vRev = peers.versionRev;
+				}
 			}
 			statusWrites.push(
 				prisma.network_members.updateMany({ where: { nwid, id: db.id }, data }),
@@ -551,17 +560,113 @@ export const attachLiveStatus = async (
 	for (const peer of controllerPeers) {
 		peersByAddress.set(peer.address, peer as unknown as Peers);
 	}
-	return members.map((db) => {
-		const peers = peersByAddress.get(db.address || "") ?? ({} as Peers);
-		const activePreferredPath = findActivePreferredPeerPath(peers);
-		const member = {
-			...db,
-			peers,
-			physicalAddress: activePreferredPath?.address ?? db.physicalAddress,
-		} as unknown as MemberEntity;
-		member.conStatus = determineConnectionStatus(member);
-		return member;
+	return members.map((db) =>
+		buildServedMember(db, peersByAddress.get(db.address || "") ?? ({} as Peers)),
+	);
+};
+
+/**
+ * Builds the member object served to API/page consumers: the cached raw
+ * controller member (documented long-tail fields like objtype, identity, tags,
+ * #983) overlaid with the DB row (the actively maintained truth — name,
+ * authorized, status, version — so a stale cached object never wins) plus live
+ * peer data and version semantics (#984).
+ */
+const buildServedMember = (db: network_members, peers: Peers): MemberEntity => {
+	const { controllerConfig, ...dbFields } = db;
+	const cached = (controllerConfig ?? {}) as Partial<MemberEntity>;
+	const activePreferredPath = findActivePreferredPeerPath(peers);
+	const member = {
+		...cached,
+		...dbFields,
+		name: preferredMemberName(dbFields.name, cached.name),
+		peers,
+		physicalAddress: activePreferredPath?.address ?? db.physicalAddress,
+	} as unknown as MemberEntity;
+	member.conStatus = determineConnectionStatus(member);
+	applyMemberVersion(member, peers);
+	return member;
+};
+
+/**
+ * Single source of truth for the DB columns produced from a freshly fetched
+ * controller member object: the last known client version (#984) and the raw
+ * object itself, which serves the documented long-tail REST fields that have
+ * no dedicated column (#983). Used by the reconcile and by the REST update
+ * write-through so the two can never diverge.
+ */
+export const controllerCacheFields = (
+	detail: MemberEntity,
+): Prisma.network_membersUpdateManyMutationInput => ({
+	vMajor: detail.vMajor ?? -1,
+	vMinor: detail.vMinor ?? -1,
+	vRev: detail.vRev ?? -1,
+	vProto: detail.vProto ?? -1,
+	controllerConfig: detail as unknown as Prisma.InputJsonValue,
+});
+
+/**
+ * Write-through cache update: persists a freshly fetched controller member
+ * object so DB-first reads serve it immediately, without waiting for the next
+ * reconcile. Call this from any mutation path that already holds the fresh
+ * controller object (it costs one DB write and no controller calls).
+ */
+export const cacheControllerMember = async (
+	nwid: string,
+	detail: MemberEntity,
+): Promise<void> => {
+	if (!detail?.id) return;
+	await prisma.network_members.updateMany({
+		where: { nwid, id: detail.id },
+		data: controllerCacheFields(detail),
 	});
+};
+
+/**
+ * Name preservation (#719): a user-set DB name always wins; the controller's
+ * copy (possibly empty or stale) is only a fallback. The fallback covers
+ * installs migrating from a setup where names were stored on the controller
+ * by another UI, before the reconcile's name adoption has imported them.
+ */
+export const preferredMemberName = (
+	dbName: string | null | undefined,
+	controllerName: string | null | undefined,
+): string | null => {
+	if (dbName?.trim()) return dbName;
+	if (controllerName?.trim()) return controllerName;
+	return null;
+};
+
+/**
+ * Strips internal-only columns from a member DB row before it is merged into
+ * any client-facing response. `controllerConfig` is a server-side cache; its
+ * contents are served field-by-field (buildServedMember), never as a blob.
+ * Null-safe so callers can spread the result directly.
+ */
+export const serializeMemberRow = <T extends { controllerConfig?: unknown }>(
+	row: T | null | undefined,
+): Omit<T, "controllerConfig"> | Record<string, never> => {
+	if (!row) return {};
+	const { controllerConfig: _internal, ...rest } = row;
+	return rest;
+};
+
+/**
+ * Version semantics for a served member (#984): a DB NULL (row not yet
+ * backfilled) surfaces as the controller's -1 "unknown", and while the member
+ * is online the live peer version wins over the cached one. In-memory only —
+ * persisting the version is the reconcile's job.
+ */
+const applyMemberVersion = (member: MemberEntity, peers: Peers): void => {
+	member.vMajor ??= -1;
+	member.vMinor ??= -1;
+	member.vRev ??= -1;
+	member.vProto ??= -1;
+	if (typeof peers.versionMajor === "number" && peers.versionMajor !== -1) {
+		member.vMajor = peers.versionMajor;
+		member.vMinor = peers.versionMinor;
+		member.vRev = peers.versionRev;
+	}
 };
 
 // In-flight guard: keyed by network id, dedupes concurrent reconciles (the 10s

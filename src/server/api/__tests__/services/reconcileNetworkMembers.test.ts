@@ -32,6 +32,13 @@ const dbRow = (id: string, over: Record<string, unknown> = {}) => ({
 	physicalAddress: null,
 	ipAssignments: [],
 	notations: [],
+	// Version + controller object caches already backfilled (-1 = controller
+	// "unknown"); tests opt into the NULL backfill paths explicitly.
+	vMajor: -1,
+	vMinor: -1,
+	vRev: -1,
+	vProto: -1,
+	controllerConfig: {},
 	...over,
 });
 
@@ -125,5 +132,147 @@ describe("reconcileNetworkMembers — revision-delta sync", () => {
 		const call = dbMock.updateMany.mock.calls[0][0];
 		expect(call.where).toEqual({ nwid, id: "A" });
 		expect(call.data.online).toBe(true);
+	});
+
+	test("caches the controller-reported client version on detail fetch (#984)", async () => {
+		ztMock.network_members.mockResolvedValue({ A: 2 });
+		ztMock.member_details.mockResolvedValue(
+			dbRow("A", { authorized: true, vMajor: 1, vMinor: 14, vRev: 2, vProto: 12 }),
+		);
+		dbMock.findMany
+			.mockResolvedValueOnce([dbRow("A", { revision: 1 })])
+			.mockResolvedValueOnce([
+				dbRow("A", { revision: 2, vMajor: 1, vMinor: 14, vRev: 2, vProto: 12 }),
+			]);
+
+		const result = await reconcileNetworkMembers(ctx, nwid);
+
+		const configWrite = dbMock.updateMany.mock.calls[0][0];
+		expect(configWrite.where).toEqual({ nwid, id: "A" });
+		expect(configWrite.data).toMatchObject({
+			vMajor: 1,
+			vMinor: 14,
+			vRev: 2,
+			vProto: 12,
+		});
+		// The raw controller member object is cached alongside (#983).
+		expect(configWrite.data.controllerConfig).toMatchObject({ id: "A" });
+		expect(result[0]).toMatchObject({ vMajor: 1, vMinor: 14, vRev: 2, vProto: 12 });
+	});
+
+	test("serves documented controller fields from the cached object (#983)", async () => {
+		ztMock.network_members.mockResolvedValue({ A: 1 });
+		dbMock.findMany.mockResolvedValueOnce([dbRow("A")]).mockResolvedValueOnce([
+			dbRow("A", {
+				name: "user-set-name",
+				controllerConfig: {
+					objtype: "member",
+					identity: "A:pubkey",
+					name: "controller-name",
+					tags: [],
+					capabilities: [],
+					ssoExempt: false,
+					lastAuthorizedTime: 123,
+				},
+			}),
+		]);
+
+		const result = await reconcileNetworkMembers(ctx, nwid);
+
+		expect(result[0]).toMatchObject({
+			objtype: "member",
+			identity: "A:pubkey",
+			tags: [],
+			capabilities: [],
+			ssoExempt: false,
+			lastAuthorizedTime: 123,
+		});
+		// DB-maintained columns win over the cached controller object.
+		expect(result[0].name).toBe("user-set-name");
+		// The internal cache blob itself is never served.
+		expect(result[0]).not.toHaveProperty("controllerConfig");
+	});
+
+	test("falls back to the controller name when the DB has none (migration)", async () => {
+		// Install migrated from a controller-stored-names setup: the DB row has no
+		// name yet, but the cached controller object does. The empty DB value must
+		// not mask it (#719).
+		ztMock.network_members.mockResolvedValue({ A: 1 });
+		dbMock.findMany
+			.mockResolvedValueOnce([dbRow("A")])
+			.mockResolvedValueOnce([
+				dbRow("A", { name: null, controllerConfig: { name: "controller-name" } }),
+			]);
+
+		const result = await reconcileNetworkMembers(ctx, nwid);
+
+		expect(result[0].name).toBe("controller-name");
+	});
+
+	test("backfills rows missing the cached controller object", async () => {
+		// Version already cached, revision unchanged — only the raw object is missing.
+		ztMock.network_members.mockResolvedValue({ A: 1 });
+		dbMock.findMany
+			.mockResolvedValueOnce([dbRow("A", { controllerConfig: null })])
+			.mockResolvedValueOnce([dbRow("A")]);
+
+		await reconcileNetworkMembers(ctx, nwid);
+
+		expect(ztMock.member_details).toHaveBeenCalledWith(ctx, nwid, "A", false);
+	});
+
+	test("backfills rows that predate the version cache (vMajor NULL)", async () => {
+		// Revision matches, but the row has never had its version fetched.
+		ztMock.network_members.mockResolvedValue({ A: 1 });
+		ztMock.member_details.mockResolvedValue(
+			dbRow("A", { authorized: true, vMajor: 1, vMinor: 14, vRev: 2, vProto: 12 }),
+		);
+		dbMock.findMany
+			.mockResolvedValueOnce([
+				dbRow("A", { vMajor: null, vMinor: null, vRev: null, vProto: null }),
+			])
+			.mockResolvedValueOnce([
+				dbRow("A", { vMajor: 1, vMinor: 14, vRev: 2, vProto: 12 }),
+			]);
+
+		await reconcileNetworkMembers(ctx, nwid);
+
+		expect(ztMock.member_details).toHaveBeenCalledWith(ctx, nwid, "A", false);
+		const configWrite = dbMock.updateMany.mock.calls[0][0];
+		expect(configWrite.data).toMatchObject({
+			vMajor: 1,
+			vMinor: 14,
+			vRev: 2,
+			vProto: 12,
+		});
+	});
+
+	test("refreshes the cached version from the live peer while online", async () => {
+		// Revision unchanged (a version bump does not touch the member revision),
+		// so no detail fetch happens — the live peer is the only fresh source.
+		ztMock.network_members.mockResolvedValue({ A: 1 });
+		dbMock.findMany
+			.mockResolvedValueOnce([dbRow("A", { vMajor: 1, vMinor: 12, vRev: 0 })])
+			.mockResolvedValueOnce([dbRow("A", { vMajor: 1, vMinor: 12, vRev: 0 })]);
+		ztMock.peers.mockResolvedValue([
+			{
+				address: "A",
+				versionMajor: 1,
+				versionMinor: 14,
+				versionRev: 2,
+				latency: 10,
+				paths: [{ address: "10.0.0.1/9993", active: true, preferred: true }],
+			},
+		]);
+
+		const result = await reconcileNetworkMembers(ctx, nwid);
+
+		expect(ztMock.member_details).not.toHaveBeenCalled();
+		const statusWrite = dbMock.updateMany.mock.calls[0][0];
+		expect(statusWrite.where).toEqual({ nwid, id: "A" });
+		expect(statusWrite.data).toMatchObject({ vMajor: 1, vMinor: 14, vRev: 2 });
+		// The peer object carries no protocol version — the cached vProto stays.
+		expect(statusWrite.data.vProto).toBeUndefined();
+		expect(result[0]).toMatchObject({ vMajor: 1, vMinor: 14, vRev: 2 });
 	});
 });

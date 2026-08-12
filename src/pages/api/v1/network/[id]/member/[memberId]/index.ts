@@ -1,6 +1,11 @@
 import { network_members } from "@prisma/client";
 import type { NextApiRequest, NextApiResponse } from "next";
 import { appRouter } from "~/server/api/root";
+import {
+	cacheControllerMember,
+	preferredMemberName,
+	serializeMemberRow,
+} from "~/server/api/services/memberService";
 import { prisma } from "~/server/db";
 import { SecuredPrivateApiRoute } from "~/utils/apiRouteAuth";
 import { handleApiErrors } from "~/utils/errors";
@@ -195,10 +200,17 @@ const POST_updateNetworkMember = SecuredPrivateApiRoute(
 				return res.status(404).json({ error: "Member not found in controller" });
 			}
 
+			// Write-through: persist the refetched controller object so DB-first
+			// list reads reflect this update immediately (#983/#984).
+			if (controllerMember.id) {
+				await cacheControllerMember(networkId, controllerMember);
+			}
+
 			// Merge the database and controller data
 			const mergedMember = {
-				...updatedDbMember,
+				...serializeMemberRow(updatedDbMember),
 				...controllerMember,
+				name: preferredMemberName(updatedDbMember?.name, controllerMember?.name),
 			};
 
 			return res.status(200).json(mergedMember);
